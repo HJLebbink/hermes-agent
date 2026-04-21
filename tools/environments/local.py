@@ -6,8 +6,11 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
+import time
 
 from tools.environments.base import BaseEnvironment, _pipe_stdin
+from tools.interrupt import is_interrupted
 
 _IS_WINDOWS = platform.system() == "Windows"
 
@@ -182,6 +185,12 @@ _SANE_PATH = (
     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 )
 
+_SANE_PATH_WINDOWS = (
+    r"C:\Windows\System32;C:\Windows;"
+    r"C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0;"
+    r"C:\Program Files\Git\cmd;C:\Program Files\Git\bin"
+)
+
 
 def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping."""
@@ -199,8 +208,16 @@ def _make_run_env(env: dict) -> dict:
         elif k not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(k):
             run_env[k] = v
     existing_path = run_env.get("PATH", "")
-    if "/usr/bin" not in existing_path.split(":"):
-        run_env["PATH"] = f"{existing_path}:{_SANE_PATH}" if existing_path else _SANE_PATH
+    if _IS_WINDOWS:
+        path_delim = ";"
+        sane_path = _SANE_PATH_WINDOWS
+        check_path = r"C:\Windows\System32"
+    else:
+        path_delim = ":"
+        sane_path = _SANE_PATH
+        check_path = "/usr/bin"
+    if check_path.lower() not in (p.lower() for p in existing_path.split(path_delim)):
+        run_env["PATH"] = f"{existing_path}{path_delim}{sane_path}" if existing_path else sane_path
 
     # Per-profile HOME isolation: redirect system tool configs (git, ssh, gh,
     # npm …) into {HERMES_HOME}/home/ when that directory exists.  Only the
@@ -373,6 +390,67 @@ class LocalEnvironment(BaseEnvironment):
                 proc.kill()
             except Exception:
                 pass
+
+    def _wait_for_process(self, proc, timeout: int = 120) -> dict:
+        """Windows-compatible drain.
+
+        Upstream base._wait_for_process uses select() on the stdout fd; on
+        Windows select() rejects non-socket handles (WinError 10093), so the
+        drain aborts before reading any output.  Here we use blocking
+        readline() in a daemon thread — works cross-platform for pipes.
+        Tradeoff: a backgrounded grandchild that keeps the pipe open after
+        bash exits will leave the drain thread blocked, but the main poll
+        loop still returns on proc.poll().
+        """
+        if not _IS_WINDOWS:
+            return super()._wait_for_process(proc, timeout=timeout)
+
+        output_chunks: list[str] = []
+
+        def _drain():
+            try:
+                for line in iter(proc.stdout.readline, ""):
+                    output_chunks.append(line)
+            except (ValueError, OSError):
+                pass
+
+        drain_thread = threading.Thread(target=_drain, daemon=True)
+        drain_thread.start()
+        deadline = time.monotonic() + timeout
+
+        try:
+            while proc.poll() is None:
+                if is_interrupted():
+                    self._kill_process(proc)
+                    drain_thread.join(timeout=2)
+                    return {
+                        "output": "".join(output_chunks) + "\n[Command interrupted]",
+                        "returncode": 130,
+                    }
+                if time.monotonic() > deadline:
+                    self._kill_process(proc)
+                    drain_thread.join(timeout=2)
+                    partial = "".join(output_chunks)
+                    msg = f"\n[Command timed out after {timeout}s]"
+                    return {
+                        "output": partial + msg if partial else msg.lstrip(),
+                        "returncode": 124,
+                    }
+                time.sleep(0.1)
+        except (KeyboardInterrupt, SystemExit):
+            try:
+                self._kill_process(proc)
+                drain_thread.join(timeout=2)
+            except Exception:
+                pass
+            raise
+
+        drain_thread.join(timeout=2)
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        return {"output": "".join(output_chunks), "returncode": proc.returncode}
 
     def _update_cwd(self, result: dict):
         """Read CWD from temp file (local-only, no round-trip needed)."""
